@@ -208,7 +208,7 @@ class Trainer:
 
         if action_mask is not None:
             # action 只在有效维度/时间位上训练，padding 位全部归零。
-            noisy_latents *= action_mask.float() #action_mask 最终是一个 torch.bool 张量，值只有 True/False（训练里会转成 1.0/0.0）。
+            noisy_latents *= action_mask.float()
             targets *= action_mask.float()
             latent *= action_mask.float()
 
@@ -240,7 +240,6 @@ class Trainer:
             action_mode=True,
             noisy_cond_prob=0.0)
 
-        #注入文本条件和动作 mask
         latent_dict['text_emb'] = batch_dict['text_emb']
         action_dict['text_emb'] = batch_dict['text_emb']
         action_dict['actions_mask'] = batch_dict['actions_mask']
@@ -273,7 +272,6 @@ class Trainer:
                         input_dict['latent_dict']['targets'].shape[-3], input_dict['latent_dict']['targets'].shape[-2],
                         input_dict['latent_dict']['targets'].shape[-1], batch_size=latent_pred.shape[0])
         Bn, Fn = input_dict['latent_dict']['timesteps'].shape
-
         # flow-matching 在不同时间步使用不同 loss 权重。
         latent_loss_weight = self.train_scheduler_latent.training_weight(input_dict['latent_dict']['timesteps'].flatten()).reshape(Bn, Fn)
         action_loss_weight = self.train_scheduler_action.training_weight(input_dict['action_dict']['timesteps'].flatten()).reshape(Bn, Fn)
@@ -286,13 +284,13 @@ class Trainer:
         latent_loss = latent_loss.flatten(0, 1).flatten(1)  # (B, F, H, W, C) -> (B*F, H*W*C)
         # Sum per frame and compute mask per frame
         latent_loss_per_frame = latent_loss.sum(dim=1)  # (B*F,)
-        latent_mask_per_frame = torch.ones_like(latent_loss).sum(dim=1)  # (B*F,) latent 分支没有 mask，因为视频 latent 默认全有效。
+        latent_mask_per_frame = torch.ones_like(latent_loss).sum(dim=1)  # (B*F,)
         latent_loss = (latent_loss_per_frame / (latent_mask_per_frame + 1e-6)).mean()
 
         # Frame-wise action loss calculation
         action_loss = F.mse_loss(action_pred.float(), input_dict['action_dict']['targets'].float().detach(), reduction='none')
         action_loss = action_loss * action_loss_weight[:, None, :, None, None]
-        action_loss = action_loss * input_dict['action_dict']['actions_mask'].float() #加mask，不稀释真实损失
+        action_loss = action_loss * input_dict['action_dict']['actions_mask'].float()
         # Permute to (B, F, H, W, C) and flatten to (B*F, H*W*C)
         action_loss = action_loss.permute(0, 2, 3, 4, 1)  # (B, C, F, H, W) -> (B, F, H, W, C)
         action_mask = input_dict['action_dict']['actions_mask'].float().permute(0, 2, 3, 4, 1)  # (B, C, F, H, W) -> (B, F, H, W, C)
@@ -304,9 +302,6 @@ class Trainer:
         action_loss = (action_loss_per_frame / (action_mask_per_frame + 1e-6)).mean()
 
         # 梯度累积时，将单次前向 loss 按累积步数缩放。
-        # 在训练循环中控制何时同步更新权重，这里 loss 先除以累积步数，确保最终梯度正确。
-        # self.gradient_accumulation_steps 在 Trainer 初始化时从 config 读取，默认为 1（即不使用梯度累积）。
-        # 为什么会做k次backward：因为它在用“梯度累积”模拟更大的 batch，但显存不够一次塞下。
         return latent_loss / self.gradient_accumulation_steps, action_loss / self.gradient_accumulation_steps
 
     def _train_step(self, batch, batch_idx):
@@ -332,8 +327,6 @@ class Trainer:
         
         # Only update weights after accumulating gradients
         if should_sync:
-            #每个 mini-batch 都会 loss.backward()
-            #只有每第 k 个 mini-batch 才 optimizer.step()
             total_norm = torch.nn.utils.clip_grad_norm_(self.transformer.parameters(), 2.0)
             self.optimizer.step()
             self.lr_scheduler.step()

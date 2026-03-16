@@ -306,7 +306,7 @@ class Trainer:
         # 梯度累积时，将单次前向 loss 按累积步数缩放。
         # 在训练循环中控制何时同步更新权重，这里 loss 先除以累积步数，确保最终梯度正确。
         # self.gradient_accumulation_steps 在 Trainer 初始化时从 config 读取，默认为 1（即不使用梯度累积）。
-        # 为什么会做k次backward：因为它在用“梯度累积”模拟更大的 batch，但显存不够一次塞下。
+        # 为什么会做k次backward：
         return latent_loss / self.gradient_accumulation_steps, action_loss / self.gradient_accumulation_steps
 
     def _train_step(self, batch, batch_idx):
@@ -332,8 +332,6 @@ class Trainer:
         
         # Only update weights after accumulating gradients
         if should_sync:
-            #每个 mini-batch 都会 loss.backward()
-            #只有每第 k 个 mini-batch 才 optimizer.step()
             total_norm = torch.nn.utils.clip_grad_norm_(self.transformer.parameters(), 2.0)
             self.optimizer.step()
             self.lr_scheduler.step()

@@ -742,9 +742,9 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
 
         latent_grid_id = latent_dict['grid_id'].permute(1, 0, 2).flatten(1)[None]
         action_grid_id = action_dict['grid_id'].permute(1, 0, 2).flatten(1)[None]
-        full_grid_id = torch.cat([latent_grid_id] * 2 + [action_grid_id] * 2, dim=2) #每个latent/action token 对应一个 grid_id，ROPE 位置编码基于此构造。   
+        full_grid_id = torch.cat([latent_grid_id] * 2 + [action_grid_id] * 2, dim=2)
 
-        rotary_emb = self.rope(full_grid_id)[:, :, None] #ROPE 位置编码，扩展到每个 token 粒度。
+        rotary_emb = self.rope(full_grid_id)[:, :, None] 
 
         latent_time_steps = torch.cat(
             [latent_dict['timesteps'].flatten(0, 1), latent_dict['cond_timesteps'].flatten(0, 1)]
@@ -777,7 +777,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                       condition_latent_hidden_states.shape[1], 
                       action_hidden_states.shape[1], 
                       condition_action_hidden_states.shape[1],
-                      padded_length] #把大拼接序列再切会各分支的长度表
+                      padded_length]
 
         # flex-attention 的时序/窗口掩码由 chunk_size 与 window_size 动态决定。
         FlexAttnFunc.init_mask(latent_dict['noisy_latents'].shape, 
@@ -787,16 +787,14 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                window_size=input_dict['window_size'],
                                patch_size=self.patch_size,
                                device=hidden_states.device
-                               )#FlexAttnFunc.init_mask() 是限制“谁能看谁”的规则生成器
+                               )
 
         for block in self.blocks:
             hidden_states = block(hidden_states,
                                          text_hidden_states,
                                          timestep_proj,
-                                         rotary_emb, #ROPE 位置编码在每层做相同的加法，且不参与梯度更新（只要输入的 grid_id 不变，ROPE 编码就是固定的）。update_cache 传入 0/1/2 分别代表正常前向/写入预测缓存/写入真实缓存，block 内根据这个参数决定是否更新 KV cache，以及是否把当前写入的 KV 纳入注意力计算。
-                                         update_cache=False) #每层做：Self-Attn（带 RoPE）→ Cross-Attn（看 text）→ FFN
-        
-        #输出前归一化与时间调制
+                                         rotary_emb,
+                                         update_cache=False)
         temb_scale_shift_table = self.scale_shift_table[None] + temb[:, :, None, ...]
         shift, scale = rearrange(temb_scale_shift_table,
                                  'b l n c -> b n l c').chunk(2, dim=1)
@@ -805,8 +803,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         hidden_states = (self.norm_out(hidden_states.float()) *
                                 (1. + scale) +
                                 shift).type_as(hidden_states)
-        
-        #按split_list切回 latent/action 两条流，并分别做线性映射与形状变换得到最终输出。
         latent_hidden_states, _, action_hidden_states, _, _ = torch.split(hidden_states, split_list, dim=1)
         latent_hidden_states = self.proj_out(latent_hidden_states)
         latent_hidden_states = rearrange(latent_hidden_states,

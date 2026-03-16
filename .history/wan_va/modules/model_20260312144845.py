@@ -793,10 +793,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             hidden_states = block(hidden_states,
                                          text_hidden_states,
                                          timestep_proj,
-                                         rotary_emb, #ROPE 位置编码在每层做相同的加法，且不参与梯度更新（只要输入的 grid_id 不变，ROPE 编码就是固定的）。update_cache 传入 0/1/2 分别代表正常前向/写入预测缓存/写入真实缓存，block 内根据这个参数决定是否更新 KV cache，以及是否把当前写入的 KV 纳入注意力计算。
-                                         update_cache=False) #每层做：Self-Attn（带 RoPE）→ Cross-Attn（看 text）→ FFN
-        
-        #输出前归一化与时间调制
+                                         rotary_emb,
+                                         update_cache=False)
         temb_scale_shift_table = self.scale_shift_table[None] + temb[:, :, None, ...]
         shift, scale = rearrange(temb_scale_shift_table,
                                  'b l n c -> b n l c').chunk(2, dim=1)
@@ -805,8 +803,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         hidden_states = (self.norm_out(hidden_states.float()) *
                                 (1. + scale) +
                                 shift).type_as(hidden_states)
-        
-        #按split_list切回 latent/action 两条流，并分别做线性映射与形状变换得到最终输出。
         latent_hidden_states, _, action_hidden_states, _, _ = torch.split(hidden_states, split_list, dim=1)
         latent_hidden_states = self.proj_out(latent_hidden_states)
         latent_hidden_states = rearrange(latent_hidden_states,

@@ -332,8 +332,6 @@ class Trainer:
         
         # Only update weights after accumulating gradients
         if should_sync:
-            #每个 mini-batch 都会 loss.backward()
-            #只有每第 k 个 mini-batch 才 optimizer.step()
             total_norm = torch.nn.utils.clip_grad_norm_(self.transformer.parameters(), 2.0)
             self.optimizer.step()
             self.lr_scheduler.step()
