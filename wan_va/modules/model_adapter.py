@@ -251,3 +251,12 @@ def load_model_bundle(
         required_attn_mode=required_attn_mode,
     )
 
+if __name__ == "__main__":
+    model_path = "/home/user/lingbot-va/models/lingbot-va-base"
+
+    bundle = load_model_bundle(model_path, require_inference_components=True)
+    print("Model bundle loaded successfully:")
+    print(f"Transformer: {bundle.transformer}")
+    print(f"VAE: {bundle.vae}")
+    print(f"Text Encoder: {bundle.text_encoder}")
+    print(f"Tokenizer: {bundle.tokenizer}")

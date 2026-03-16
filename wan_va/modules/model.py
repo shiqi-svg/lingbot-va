@@ -634,10 +634,12 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         inner_dim = num_attention_heads * attention_head_dim
         self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size,
                                       rope_max_seq_len)
+        
         self.patch_embedding_mlp = nn.Linear(
             in_channels * patch_size[0] * patch_size[1] * patch_size[2],
             inner_dim)
-        self.action_embedder = nn.Linear(action_dim, inner_dim)
+        self.action_embedder = nn.Linear(action_dim, inner_dim) #MoT思想体现
+
         self.condition_embedder = WanTimeTextImageEmbedding(
             dim=inner_dim,
             time_freq_dim=freq_dim,
