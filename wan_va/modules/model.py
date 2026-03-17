@@ -12,6 +12,8 @@ from diffusers.models.embeddings import (
     TimestepEmbedding,
     Timesteps,
 )
+import time
+from collections import defaultdict
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import FP32LayerNorm
 from einops import rearrange
@@ -26,10 +28,14 @@ from torch.nn.attention.flex_attention import (
 )
 from functools import partial
 
+flash_attn_func = None
 try:
     from flash_attn_interface import flash_attn_func
-except:
-    from flash_attn import flash_attn_func
+except ImportError:
+    try:
+        from flash_attn import flash_attn_func
+    except ImportError:
+        flash_attn_func = None
 
 __all__ = ['WanTransformer3DModel']
 
@@ -628,6 +634,9 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         """
         super().__init__()
         # latent/action 共用主干 Transformer，输入/输出头分离。
+        # 【计时器】记录每次 forward 中 latent/action embedding 的耗时（秒），
+        # 每次 _infer() 开始前会 clear，结束后统一汇报。
+        self._embed_timing = defaultdict(list)
         self.patch_size = patch_size
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
@@ -854,8 +863,15 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         if action_mode:  # action input emb
             latent_hidden_states = rearrange(input_dict['noisy_latents'],
                                              'b c f h w -> b (f h w) c')
+            # 【测：action embedding 耗时】
+            # 把 action token (b, f*h*w, action_dim) 经线性层映射到 transformer 内部维度。
+            # 动作去噪的每一步都调用一次，最终报总耗时和单次平均。
+            torch.cuda.synchronize()      # 等 GPU 执行完，保证起始时间准确
+            _t0 = time.perf_counter()
             latent_hidden_states = self.action_embedder(
                 latent_hidden_states)  # B L1 C
+            torch.cuda.synchronize()      # 等 GPU 执行完，保证结束时间准确
+            self._embed_timing['action_embed'].append(time.perf_counter() - _t0)
         else:  # latent input emb
             latent_hidden_states = rearrange(
                 input_dict['noisy_latents'],
@@ -863,8 +879,15 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 p1=self.patch_size[0],
                 p2=self.patch_size[1],
                 p3=self.patch_size[2])
+            # 【测：latent embedding 耗时】
+            # 把 patchify 后的视频 latent 经 patch_embedding_mlp 映射到 transformer 内部维度。
+            # 视频去噪的每一步都调用一次，最终报总耗时和单次平均。
+            torch.cuda.synchronize()      # 等 GPU 执行完，保证起始时间准确
+            _t0 = time.perf_counter()
             latent_hidden_states = self.patch_embedding_mlp(
                 latent_hidden_states)
+            torch.cuda.synchronize()      # 等 GPU 执行完，保证结束时间准确
+            self._embed_timing['latent_embed'].append(time.perf_counter() - _t0)
         text_hidden_states = self.condition_embedder.text_embedder(
             input_dict["text_emb"])  # B L2 C
 

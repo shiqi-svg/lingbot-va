@@ -481,10 +481,19 @@ class VA_Server:
             mode='constant',
             value=0)
 
+        # ---- 计时初始化 ----
+        self.transformer._embed_timing.clear()               # 清空上一次 _infer 留下的 embedding 计时数据
+        gpu_mem_before = torch.cuda.memory_allocated() / 1024 ** 3  # 【测：_infer 开始前的显存占用（GB）】
+        torch.cuda.synchronize()                             # 等 GPU 空闲，使起始时间点准确
+        t_infer_start = time.perf_counter()                  # 【测：预测一次动作块的总耗时起点】
+        # -------------------
+
         with (
                 torch.no_grad(),
         ):
             # 1. Video Generation Loop
+            torch.cuda.synchronize()                         # 等 GPU 空闲
+            t_video_start = time.perf_counter()              # 【测：视频 FDM 去噪循环耗时起点】
             for i, t in enumerate(tqdm(timesteps)):
                 last_step = i == len(timesteps) - 1
                 latent_cond = init_latent[:, :, 0:1].to(
@@ -520,6 +529,12 @@ class VA_Server:
 
                 latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
 
+            torch.cuda.synchronize()                         # 等 GPU 跑完最后一步
+            t_video_end = time.perf_counter()                # 【测：视频 FDM 去噪循环耗时终点】
+
+            # 2. Action Generation Loop
+            torch.cuda.synchronize()                         # 等 GPU 空闲
+            t_action_start = time.perf_counter()             # 【测：动作 FDM 去噪循环耗时起点】
             for i, t in enumerate(tqdm(action_timesteps)):
                 last_step = i == len(action_timesteps) - 1
                 action_cond = torch.zeros(
@@ -558,6 +573,42 @@ class VA_Server:
                                                          return_dict=False)
 
                 actions[:, :, 0:1] = action_cond if frame_st_id == 0 else actions[:, :, 0:1]
+
+            torch.cuda.synchronize()                         # 等 GPU 跑完最后一步
+            t_action_end = time.perf_counter()               # 【测：动作 FDM 去噪循环耗时终点】
+
+        torch.cuda.synchronize()                             # 等所有 GPU 操作完成
+        t_infer_end = time.perf_counter()                    # 【测：预测一次动作块的总耗时终点】
+        gpu_mem_after = torch.cuda.memory_allocated() / 1024 ** 3   # 【测：_infer 结束后的显存占用（GB）】
+        gpu_mem_peak  = torch.cuda.max_memory_allocated() / 1024 ** 3  # 【测：_infer 期间显存占用峰值（GB）】
+
+        # 【测：GPU 核心占用率（%）】在 inference 结束时通过 pynvml 采样一次
+        # 若需更精确数据，可改为推理期间每 100ms 后台采样取平均
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(self.device.index or 0)
+            gpu_util = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
+        except Exception:
+            gpu_util = None  # 未安装时跳过：pip install nvidia-ml-py
+
+        # 从 model 内部取回 embedding 计时列表，格式化为"总耗时 / 单次平均 / 调用次数"
+        embed_t = self.transformer._embed_timing
+        def _ms(lst): return f"{sum(lst)*1000:.1f} ms total / {sum(lst)/len(lst)*1000:.2f} ms avg ({len(lst)} calls)" if lst else "N/A"
+
+        logger.info(
+            "[Profiling] " + "=" * 60 + "\n"
+            f"  Total _infer          : {(t_infer_end  - t_infer_start)*1000:.1f} ms\n"    # 预测一次动作块总耗时（视频+动作去噪+前后处理）
+            f"  Video FDM loop        : {(t_video_end  - t_video_start)*1000:.1f} ms  ({self.job_config.num_inference_steps} steps)\n"          # 视频 FDM 去噪 N 步总耗时
+            f"  Action FDM loop       : {(t_action_end - t_action_start)*1000:.1f} ms  ({self.job_config.action_num_inference_steps} steps)\n"  # 动作 FDM 去噪 N 步总耗时
+            f"  Latent embed (MLP)    : {_ms(embed_t.get('latent_embed', []))}\n"           # patch_embedding_mlp：视频 latent→transformer 维度，每步一次
+            f"  Action embed (linear) : {_ms(embed_t.get('action_embed', []))}\n"           # action_embedder linear：action→transformer 维度，每步一次
+            f"  GPU mem before        : {gpu_mem_before:.2f} GB\n"                          # _infer 开始前已分配显存
+            f"  GPU mem after         : {gpu_mem_after:.2f} GB\n"                           # _infer 结束后已分配显存
+            f"  GPU mem peak          : {gpu_mem_peak:.2f} GB\n"                            # _infer 期间显存峰值（最关键的显存指标）
+            + (f"  GPU utilization       : {gpu_util} %\n" if gpu_util is not None else "  GPU utilization       : pynvml not available\n")  # GPU 核心占用率
+            + "[Profiling] " + "=" * 60
+        )
 
         actions[:, ~self.action_mask] *= 0
 
