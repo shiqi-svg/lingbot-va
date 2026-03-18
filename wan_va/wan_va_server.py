@@ -594,15 +594,17 @@ class VA_Server:
 
         # 从 model 内部取回 embedding 计时列表，格式化为"总耗时 / 单次平均 / 调用次数"
         embed_t = self.transformer._embed_timing
+        def _pct(elapsed_s): return f"{elapsed_s / (t_infer_end - t_infer_start) * 100:.1f}%" if (t_infer_end - t_infer_start) > 0 else "N/A"
         def _ms(lst): return f"{sum(lst)*1000:.1f} ms total / {sum(lst)/len(lst)*1000:.2f} ms avg ({len(lst)} calls)" if lst else "N/A"
 
+        total_infer_time = (t_infer_end  - t_infer_start)*1000
         logger.info(
             "[Profiling] " + "=" * 60 + "\n"
             f"  Total _infer          : {(t_infer_end  - t_infer_start)*1000:.1f} ms\n"    # 预测一次动作块总耗时（视频+动作去噪+前后处理）
-            f"  Video FDM loop        : {(t_video_end  - t_video_start)*1000:.1f} ms  ({self.job_config.num_inference_steps} steps)\n"          # 视频 FDM 去噪 N 步总耗时
-            f"  Action FDM loop       : {(t_action_end - t_action_start)*1000:.1f} ms  ({self.job_config.action_num_inference_steps} steps)\n"  # 动作 FDM 去噪 N 步总耗时
-            f"  Latent embed (MLP)    : {_ms(embed_t.get('latent_embed', []))}\n"           # patch_embedding_mlp：视频 latent→transformer 维度，每步一次
-            f"  Action embed (linear) : {_ms(embed_t.get('action_embed', []))}\n"           # action_embedder linear：action→transformer 维度，每步一次
+            f"  Video FDM loop        : {(t_video_end  - t_video_start)*1000:.1f} ms  ({self.job_config.num_inference_steps} steps), percentage:{((t_video_end  - t_video_start)*1000/total_infer_time)*100:.1f}% \n"          # 视频 FDM 去噪 N 步总耗时
+            f"  Action FDM loop       : {(t_action_end - t_action_start)*1000:.1f} ms  ({self.job_config.action_num_inference_steps} steps), percentage:{((t_action_end - t_action_start)*1000/total_infer_time)*100:.1f}%\n"  # 动作 FDM 去噪 N 步总耗时
+            f"  Latent embed (MLP)    : {_ms(embed_t.get('latent_embed', []))}, percentage:{_pct(sum(embed_t.get('latent_embed', [])))}\n"           # patch_embedding_mlp：视频 latent→transformer 维度，每步一次
+            f"  Action embed (linear) : {_ms(embed_t.get('action_embed', []))}, percentage:{_pct(sum(embed_t.get('action_embed', [])))}\n"           # action_embedder linear：action→transformer 维度，每步一次
             f"  GPU mem before        : {gpu_mem_before:.2f} GB\n"                          # _infer 开始前已分配显存
             f"  GPU mem after         : {gpu_mem_after:.2f} GB\n"                           # _infer 结束后已分配显存
             f"  GPU mem peak          : {gpu_mem_peak:.2f} GB\n"                            # _infer 期间显存峰值（最关键的显存指标）
