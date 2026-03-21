@@ -5,6 +5,7 @@ from copy import deepcopy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.attention import FeedForward
 from diffusers.models.embeddings import (
@@ -41,8 +42,17 @@ __all__ = ['WanTransformer3DModel']
 
 
 def custom_sdpa(q, k, v):
-    out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
-                                         v.transpose(1, 2))
+    # Avoid the cuDNN SDPA backend, which fails to build execution plans on B300.
+    with sdpa_kernel([
+        SDPBackend.FLASH_ATTENTION,
+        SDPBackend.EFFICIENT_ATTENTION,
+        SDPBackend.MATH,
+    ]):
+        out = F.scaled_dot_product_attention(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+        )
     return out.transpose(1, 2)
 
 class FlexAttnFunc(nn.Module):

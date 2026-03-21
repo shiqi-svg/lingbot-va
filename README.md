@@ -60,10 +60,20 @@ https://github.com/user-attachments/assets/cec7b7a6-953b-4fa4-8f1a-47efc1fce547
  • Pytorch == 2.9.0
  • CUDA 12.6
 
+If you are running on NVIDIA B300 / Blackwell-class GPUs with compute capability `sm_103`, do not use the stable `cu126` or `cu128` wheels. On this machine, inference was validated with PyTorch nightly `cu130`.
+
 ```bash
 pip install torch==2.9.0 torchvision==0.24.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cu126
 pip install websockets einops diffusers==0.36.0 transformers==4.55.2 accelerate msgpack opencv-python matplotlib ftfy easydict
 pip install flash-attn --no-build-isolation
+```
+
+Validated example for B300 / `sm_103` machines:
+
+```bash
+pip uninstall -y torch torchvision torchaudio flash-attn
+pip install --pre --upgrade --force-reinstall torch==2.12.0.dev20260320 torchvision==0.26.0.dev20260320 torchaudio==2.11.0.dev20260320 --index-url https://download.pytorch.org/whl/nightly/cu130
+pip install numpy==1.26.4
 ```
 
 
