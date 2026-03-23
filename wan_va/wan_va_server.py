@@ -34,8 +34,33 @@ from utils import (
     init_logger,
     logger,
     run_async_server_mode,
-    save_async,
+    save_async, 
 )
+import torch.nn as nn
+from thop import profile
+
+
+class FLOPsWarpper(nn.Module):
+    def __init__(self,
+                 transformer,
+                 cache_name,
+                 keys,
+                 action_mode,
+                 is_last_step=False):
+        super(FLOPsWarpper, self).__init__()
+        self.transformer = transformer
+        self.cache_name = cache_name
+        self.keys = keys
+        self.action_mode = action_mode
+        self.is_last_step = is_last_step
+
+    def forward(self, *args):
+        input_data = dict(zip(self.keys, args))
+        return self.transformer(
+                    input_data,
+                    update_cache=1 if self.is_last_step else 0,
+                    cache_name=self.cache_name,
+                    action_mode=self.action_mode)
 
 
 class VA_Server:
@@ -251,15 +276,30 @@ class VA_Server:
         return action[self.job_config.used_action_channel_ids]
     
     def _repeat_input_for_cfg(self, input_dict):
+        repeated_input = dict(input_dict)
         if self.use_cfg:
-            input_dict['noisy_latents'] = input_dict['noisy_latents'].repeat(2, 1, 1, 1, 1)
-            input_dict['text_emb'] = torch.cat([self.prompt_embeds.to(self.dtype).clone(), self.negative_prompt_embeds.to(self.dtype).clone()], dim=0)
-            input_dict['grid_id'] = input_dict['grid_id'][None].repeat(2, 1, 1)
-            input_dict['timesteps'] = input_dict['timesteps'][None].repeat(2, 1)
+            repeated_input['noisy_latents'] = input_dict['noisy_latents'].repeat(2, 1, 1, 1, 1)
+            repeated_input['text_emb'] = torch.cat([
+                self.prompt_embeds.to(self.dtype).clone(),
+                self.negative_prompt_embeds.to(self.dtype).clone()
+            ], dim=0)
+            repeated_input['grid_id'] = input_dict['grid_id'][None].repeat(2, 1, 1)
+            repeated_input['timesteps'] = input_dict['timesteps'][None].repeat(2, 1)
         else:
-            input_dict['grid_id'] = input_dict['grid_id'][None]
-            input_dict['timesteps'] = input_dict['timesteps'][None]
-        return input_dict
+            repeated_input['grid_id'] = input_dict['grid_id'][None]
+            repeated_input['timesteps'] = input_dict['timesteps'][None]
+        return repeated_input
+
+    def _profile_transformer_flops(self, input_dict, action_mode):
+        keys = list(input_dict.keys())
+        tensors = tuple(input_dict[key] for key in keys)
+        profiler = FLOPsWarpper(self.transformer,
+                                self.cache_name,
+                                keys,
+                                action_mode=action_mode,
+                                is_last_step=False).to(self.device)
+        macs, params = profile(profiler, inputs=tensors, verbose=False)
+        return float(macs) * 2.0, float(params)
 
     def _prepare_latent_input(self,
                               latent_model_input,
@@ -488,6 +528,11 @@ class VA_Server:
         t_infer_start = time.perf_counter()                  # 【测：预测一次动作块的总耗时起点】
         # -------------------
 
+        video_flops_per_step = 0.0
+        action_flops_per_step = 0.0
+        video_params = 0.0
+        action_params = 0.0
+
         with (
                 torch.no_grad(),
         ):
@@ -507,11 +552,19 @@ class VA_Server:
                     None,
                     frame_st_id=frame_st_id)
 
+                tmp_input = self._repeat_input_for_cfg(input_dict['latent_res_lst'])
                 video_noise_pred = self.transformer(
-                    self._repeat_input_for_cfg(input_dict['latent_res_lst']),
+                    tmp_input,
                     update_cache=1 if last_step else 0,
                     cache_name=self.cache_name,
                     action_mode=False)
+
+                if video_flops_per_step == 0.0:
+                    video_flops_per_step, video_params = self._profile_transformer_flops(
+                        tmp_input,
+                        action_mode=False)
+                    logger.info(
+                        f"latent FLOPs/step: {video_flops_per_step}, params: {video_params}")
 
                 if not last_step or video_step != -1:
                     video_noise_pred = data_seq_to_patch(
@@ -553,11 +606,19 @@ class VA_Server:
                     None,
                     action_cond,
                     frame_st_id=frame_st_id)
+                action_input = self._repeat_input_for_cfg(input_dict['action_res_lst'])
                 action_noise_pred = self.transformer(
-                    self._repeat_input_for_cfg(input_dict['action_res_lst']),
+                    action_input,
                     update_cache=1 if last_step else 0,
                     cache_name=self.cache_name,
                     action_mode=True)
+
+                if action_flops_per_step == 0.0:
+                    action_flops_per_step, action_params = self._profile_transformer_flops(
+                        action_input,
+                        action_mode=True)
+                    logger.info(
+                        f"action FLOPs/step: {action_flops_per_step}, params: {action_params}")
 
                 if not last_step:
                     action_noise_pred = rearrange(action_noise_pred,
@@ -597,29 +658,6 @@ class VA_Server:
         def _pct(elapsed_s): return f"{elapsed_s / (t_infer_end - t_infer_start) * 100:.1f}%" if (t_infer_end - t_infer_start) > 0 else "N/A"
         def _ms(lst): return f"{sum(lst)*1000:.1f} ms total / {sum(lst)/len(lst)*1000:.2f} ms avg ({len(lst)} calls)" if lst else "N/A"
 
-        # ---- TFLOPs/s 估算 ----
-        # 基于 Transformer 架构参数解析计算每次 forward 的理论 FLOPs，
-        # 公式：每层 = Self-Attn(QKV+O 投影 + QK^T/attn·V) + Cross-Attn(同理) + FFN(up+down)
-        patch_size = self.job_config.patch_size
-        cfg_batch = 2 if self.use_cfg else 1
-        S_latent = frame_chunk_size * (self.latent_height // patch_size[1]) * (self.latent_width // patch_size[2])
-        S_action = frame_chunk_size * self.action_per_frame
-        S_text = self.prompt_embeds.shape[1]                 # 实际 text token 长度
-        d   = self.transformer.config.num_attention_heads * self.transformer.config.attention_head_dim  # 3072
-        ffn = self.transformer.config.ffn_dim                # 14336
-        L   = self.transformer.config.num_layers             # 30
-
-        def _block_flops(B, S, S_kv, S_t, d, ffn):
-            """单个 Transformer Block 的理论 FLOPs（Self-Attn + Cross-Attn + FFN）"""
-            sa = 8 * B * S * d * d + 4 * B * S * S_kv * d   # Self-Attn proj + matmul
-            ca = 4 * B * S * d * d + 4 * B * S_t * d * d + 4 * B * S * S_t * d  # Cross-Attn
-            ff = 4 * B * S * d * ffn                         # FFN (up + down)
-            return sa + ca + ff
-
-        # Video 去噪：首 chunk 无历史 KV cache → S_kv = S_latent
-        video_flops_per_step  = L * _block_flops(cfg_batch, S_latent, S_latent, S_text, d, ffn)
-        # Action 去噪：cache 中已有 video tokens → S_kv = S_latent + S_action
-        action_flops_per_step = L * _block_flops(cfg_batch, S_action, S_latent + S_action, S_text, d, ffn)
 
         num_video_steps  = len(timesteps)
         num_action_steps = len(action_timesteps)
@@ -641,10 +679,11 @@ class VA_Server:
             f"  Action FDM loop       : {(t_action_end - t_action_start)*1000:.1f} ms  ({self.job_config.action_num_inference_steps} steps), percentage:{((t_action_end - t_action_start)*1000/total_infer_time)*100:.1f}%\n"  # 动作 FDM 去噪 N 步总耗时
             f"  Latent embed (MLP)    : {_ms(embed_t.get('latent_embed', []))}, percentage:{_pct(sum(embed_t.get('latent_embed', [])))}\n"           # patch_embedding_mlp：视频 latent→transformer 维度，每步一次
             f"  Action embed (linear) : {_ms(embed_t.get('action_embed', []))}, percentage:{_pct(sum(embed_t.get('action_embed', [])))}\n"           # action_embedder linear：action→transformer 维度，每步一次
-            f"  TFLOPs total          : {total_tflops:.2f} TFLOPs  (S_latent={S_latent}, S_action={S_action}, S_text={S_text})\n"  # 理论计算量
+            f"  TFLOPs total          : {total_tflops:.2f} TFLOPs\n"
             f"  TFLOPs/s overall      : {tflops_per_sec:.2f} TFLOPs/s\n"                   # 整体吞吐
             f"  TFLOPs/s video        : {video_tflops_s:.2f} TFLOPs/s\n"                   # 视频去噪吞吐
             f"  TFLOPs/s action       : {action_tflops_s:.2f} TFLOPs/s\n"                  # 动作去噪吞吐
+            f"  Params latent/action  : {video_params:.0f} / {action_params:.0f}\n"
             f"  GPU mem before        : {gpu_mem_before:.2f} GB\n"                          # _infer 开始前已分配显存
             f"  GPU mem after         : {gpu_mem_after:.2f} GB\n"                           # _infer 结束后已分配显存
             f"  GPU mem peak          : {gpu_mem_peak:.2f} GB\n"                            # _infer 期间显存峰值（最关键的显存指标）
